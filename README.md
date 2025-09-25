@@ -1,4 +1,4 @@
 README
 
 URL
-https://ev7.net/hint/info.php
+https://hint.ev7.net
