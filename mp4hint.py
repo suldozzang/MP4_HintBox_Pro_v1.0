@@ -7,6 +7,8 @@ import json
 import logging
 import uuid
 import struct
+import platform
+import psutil
 from datetime import datetime
 from typing import List, Optional, Tuple
 from PyQt5.QtWidgets import (
@@ -515,8 +517,71 @@ class MP4ProcessorApp(QMainWindow):
         self.check_dependencies()
         self.detect_hw_accel()
 
+    def detect_hw_accel(self):
+        """GPU/CPU 및 FFmpeg 지원 환경 감지"""
+        self.hw_accel_type = 'none'
+        self.hw_accel_combo.setEnabled(False)
+
+        vendor = "none"
+        codecs = []
+        cpu_cores = psutil.cpu_count(logical=True) or 1
+
+        # GPU 제조사 감지 (Windows만 wmi 사용)
+        if platform.system() == "Windows":
+            try:
+                import wmi
+                c = wmi.WMI()
+                for gpu in c.Win32_VideoController():
+                    name = gpu.Name.upper()
+                    if "NVIDIA" in name:
+                        vendor = "nvidia"
+                    elif "INTEL" in name:
+                        vendor = "intel"
+                    elif "AMD" in name:
+                        vendor = "amd"
+            except Exception as e:
+                self.log(f"WMI GPU 감지 실패: {e}")
+
+        # FFmpeg에서 지원하는 인코더 확인
+        try:
+            result = subprocess.run(
+                [self.ffmpeg_path, "-hide_banner", "-encoders"],
+                capture_output=True, text=True, encoding="utf-8", errors="ignore",
+                timeout=10, startupinfo=startupinfo
+            )
+            if result.returncode == 0:
+                output = result.stdout.lower()
+                if "h264_nvenc" in output:
+                    codecs.append("nvidia")
+                if "h264_qsv" in output:
+                    codecs.append("intel")
+                if "h264_amf" in output:
+                    codecs.append("amd")
+        except Exception as e:
+            self.log(f"FFmpeg 인코더 감지 실패: {e}")
+
+        # 최종 가속 방식 결정
+        if vendor == "nvidia" and "nvidia" in codecs:
+            self.hw_accel_type = "nvidia"
+        elif vendor == "intel" and "intel" in codecs:
+            self.hw_accel_type = "intel"
+        elif vendor == "amd" and "amd" in codecs:
+            self.hw_accel_type = "amd"
+        else:
+            self.hw_accel_type = "none"
+
+        # UI 반영
+        if self.hw_accel_type != "none":
+            self.hw_accel_combo.setEnabled(True)
+            self.log(f"{vendor.upper()} GPU 감지됨 → 하드웨어 가속({self.hw_accel_type}) 사용 가능")
+        else:
+            self.log(f"지원 GPU 없음 또는 FFmpeg 미지원. CPU 모드 ({cpu_cores} 쓰레드)")
+
+        # CPU 정보도 기록
+        self.log(f"CPU 코어 수: {cpu_cores}") 
+
     def init_ui(self):
-        self.setWindowTitle("MP4 HintBox Pro v1.0 - by suldo.com")
+        self.setWindowTitle("MP4 HintBox Pro - by suldo.com")
         self.setGeometry(100, 100, 1000, 600)
         
         self.setAcceptDrops(True)
@@ -613,7 +678,12 @@ class MP4ProcessorApp(QMainWindow):
         splitter.addWidget(log_widget)
         
         splitter.setSizes([500, 200])
-        
+		
+                # 프로그램 정보 라벨
+        info_label = QLabel(f"{QApplication.applicationName()} v{QApplication.applicationVersion()} © {QApplication.organizationName()}")
+        info_label.setAlignment(Qt.AlignRight)
+        main_layout.addWidget(info_label)
+
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
@@ -669,37 +739,7 @@ class MP4ProcessorApp(QMainWindow):
                 f"다음 프로그램이 설치되어 있지 않습니다:\n{', '.join(missing)}\n\n"
                 f"해당 엔진을 사용할 수 없습니다."
             )
-            
-    def detect_hw_accel(self):
-        self.hw_accel_type = 'none'
-        self.hw_accel_combo.setEnabled(False)
-        try:
-            result = subprocess.run(
-                [self.ffmpeg_path, '-hide_banner', '-hwaccels'],
-                capture_output=True, text=True, encoding='utf-8', errors='ignore',
-                timeout=10, startupinfo=startupinfo
-            )
-            if result.returncode == 0:
-                output = result.stdout.lower()
-                if 'qsv' in output:
-                    self.hw_accel_type = 'intel'
-                    self.hw_accel_combo.setEnabled(True)
-                    self.log("Intel GPU (QSV) 감지. 하드웨어 가속 사용 가능.")
-                elif 'cuda' in output or 'nvenc' in output:
-                    self.hw_accel_type = 'nvidia'
-                    self.hw_accel_combo.setEnabled(True)
-                    self.log("NVIDIA GPU (NVENC) 감지. 하드웨어 가속 사용 가능.")
-                elif 'amf' in output:
-                    self.hw_accel_type = 'amd'
-                    self.hw_accel_combo.setEnabled(True)
-                    self.log("AMD GPU (AMF) 감지. 하드웨어 가속 사용 가능.")
-                else:
-                    self.log("지원하는 하드웨어 가속기 미감지. CPU 모드.")
-            else:
-                self.log("FFmpeg에서 하드웨어 가속 정보를 얻을 수 없습니다. CPU 모드.")
-        except Exception as e:
-            self.log(f"하드웨어 가속기 감지 실패: {e}. CPU 모드.")
-            
+
     def add_files(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, "MP4 파일 선택", "",
@@ -852,7 +892,7 @@ class MP4ProcessorApp(QMainWindow):
         self.processing_worker.finished_signal.connect(self.finish_processing)
         self.processing_worker.log_signal.connect(self.log)
         self.processing_worker.start()
-        self.log(f"처리 시작: 전체 {len(filepaths)}개 파일 (처리 대상: {len(files_to_process)}개, 건너김: {len(already_processed)}개), 엔진: {self.engine_combo.currentText()}, 가속: {self.hw_accel_combo.currentText()}")
+        self.log(f"처리 시작: 전체 {len(filepaths)}개 파일 (처리 대상: {len(files_to_process)}개, 건너뜀: {len(already_processed)}개), 엔진: {self.engine_combo.currentText()}, 가속: {self.hw_accel_combo.currentText()}")
 
     def cancel_processing(self):
         if self.processing_worker:
@@ -955,7 +995,7 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     app.setApplicationName("MP4 Processor Pro")
-    app.setApplicationVersion("1.0")
+    app.setApplicationVersion("1.0.1")
     app.setOrganizationName("suldo.com")
 	
     try:
