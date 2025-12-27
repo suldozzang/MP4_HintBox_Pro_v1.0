@@ -1,4 +1,13 @@
-# -*- coding: utf-8 -*
+# -*- coding: utf-8 -*-
+"""
+MP4 HintBox Pro - Parallel/Serial selectable processing
+Refactored from mp4hint_1.0.4.py to allow choosing between:
+ - Serial processing (original ProcessingWorker using QThread)
+ - Parallel processing (ProcessWorker using QRunnable + QThreadPool)
+
+Save this file as mp4hint_parallelized.py and run with a Python environment
+that has PyQt5, psutil, and ffmpeg/MP4Box available in PATH if you want to test.
+"""
 import sys
 import os
 import shutil
@@ -19,20 +28,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QThreadPool, QRunnable, QObject, QUrl
 from PyQt5.QtGui import QFont, QPainter, QPen, QColor
 
-# 파일체크
-def check_external_tools(self):
-    missing_tools = []
-    if not shutil.which(self.ffmpeg_path):
-        missing_tools.append("FFmpeg")
-    if not shutil.which(self.mp4box_path):
-        missing_tools.append("MP4Box")
-    if missing_tools:
-        msg = f"필수 외부 프로그램이 설치 또는 경로에 없습니다: {', '.join(missing_tools)}\n"
-        msg += "아래 링크에서 설치 파일 및 안내를 확인하세요:\nhttps://ev7.net/hint/info.php"
-        QMessageBox.warning(self, "외부 프로그램 누락", msg)
-        return False
-    return True
-#콘솔x
+# 콘솔 숨기기(Windows)
 startupinfo = None
 if sys.platform == "win32":
     startupinfo = subprocess.STARTUPINFO()
@@ -59,23 +55,24 @@ class Config:
     BACKUP_ENABLED = False
     TEMP_DIR = os.path.join(os.getcwd(), "temp_mp4_processor")
     BACKUP_DIR = os.path.join(os.getcwd(), "backup_mp4_processor")
-    TIMEOUT = 120
-    
+    TIMEOUT = 3600
+    PROCESS_MODE = "serial"  # "serial" or "parallel"
+
     def __init__(self):
         os.makedirs(self.TEMP_DIR, exist_ok=True)
         if self.BACKUP_ENABLED:
             os.makedirs(self.BACKUP_DIR, exist_ok=True)
 
-# 드래그 앤 드롭을 지원하는 QListWidget 클래스
+# Drag & Drop QListWidget
 class DragDropListWidget(QListWidget):
     files_dropped = pyqtSignal(list)
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setDragDropMode(QListWidget.DropOnly)
         self.drag_active = False
-        
+
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
@@ -88,24 +85,23 @@ class DragDropListWidget(QListWidget):
                 event.ignore()
         else:
             event.ignore()
-    
+
     def dragMoveEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
             event.ignore()
-    
+
     def dragLeaveEvent(self, event):
         self.drag_active = False
         self.update()
         event.accept()
-    
+
     def dropEvent(self, event):
         self.drag_active = False
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
             file_paths = [url.toLocalFile() for url in urls if url.isLocalFile() and url.toLocalFile().lower().endswith('.mp4')]
-            
             if file_paths:
                 self.files_dropped.emit(file_paths)
                 event.acceptProposedAction()
@@ -114,7 +110,7 @@ class DragDropListWidget(QListWidget):
         else:
             event.ignore()
         self.update()
-    
+
     def paintEvent(self, event):
         super().paintEvent(event)
         if self.drag_active:
@@ -131,7 +127,7 @@ class DragDropListWidget(QListWidget):
                     "MP4 파일을 여기에 드래그하세요\n또는 '파일 추가' 버튼을 사용하세요")
             painter.end()
 
-# MP4 분석 유틸리티
+# MP4 utilities
 class MP4Utils:
     @staticmethod
     def check_hint_track_with_mp4box(filepath: str, mp4box_path: str) -> bool:
@@ -336,12 +332,14 @@ class MP4Utils:
             logger.error(f"Backup creation failed for {filepath}: {e}")
             return None
 
-# 신호를 위한 QObject 클래스
+# Signals for QRunnable workers
 class WorkerSignals(QObject):
-    result = pyqtSignal(str, str)
-    error = pyqtSignal(str, str)
+    result = pyqtSignal(str, str)  # filepath, status
+    error = pyqtSignal(str, str)   # filepath, error
+    finished = pyqtSignal(str, bool)  # filepath, success
+    log = pyqtSignal(str)
 
-# 체크 작업 클래스
+# CheckWorker remains (uses QRunnable)
 class CheckWorker(QRunnable):
     def __init__(self, filepath: str, engine: str, mp4box_path: str, ffprobe_path: str = None):
         super().__init__()
@@ -358,7 +356,7 @@ class CheckWorker(QRunnable):
         except Exception as e:
             self.signals.error.emit(self.filepath, str(e))
 
-# 처리 작업 스레드
+# Serial processing worker (original)
 class ProcessingWorker(QThread):
     progress_signal = pyqtSignal(int, int, str, str)
     finished_signal = pyqtSignal(bool, str)
@@ -384,7 +382,7 @@ class ProcessingWorker(QThread):
         success_count = 0
         error_count = 0
         skipped_count = 0
-        
+
         for idx, filepath in enumerate(self.file_list, 1):
             if self._stop_requested:
                 self.progress_signal.emit(idx, len(self.file_list), filepath, "취소됨")
@@ -392,10 +390,10 @@ class ProcessingWorker(QThread):
 
             try:
                 current_status = MP4Utils.get_processing_status(filepath, self.engine, self.mp4box_path, self.ffprobe_path)
-                
+
                 engine_specific_done = (self.engine.lower() == "ffmpeg" and "faststart 적용됨" in current_status) or \
                                        (self.engine.lower() == "mp4box" and "hint track 존재" in current_status)
-                    
+
                 if engine_specific_done:
                     self.progress_signal.emit(idx, len(self.file_list), filepath, "이미 처리됨 ⏭️")
                     skipped_count += 1
@@ -416,7 +414,7 @@ class ProcessingWorker(QThread):
                 temp_path = os.path.join(self.config.TEMP_DIR, temp_filename)
 
                 success = self._process_file(filepath, temp_path)
-                
+
                 if success and os.path.exists(temp_path):
                     shutil.move(temp_path, filepath)
                     self.progress_signal.emit(idx, len(self.file_list), filepath, "완료 ✅")
@@ -424,7 +422,7 @@ class ProcessingWorker(QThread):
                 else:
                     self.progress_signal.emit(idx, len(self.file_list), filepath, "처리 실패 ❌")
                     error_count += 1
-                    
+
                     if backup_path and os.path.exists(backup_path):
                         try:
                             shutil.copy2(backup_path, filepath)
@@ -450,14 +448,15 @@ class ProcessingWorker(QThread):
                 message = f"처리 완료: 성공 {success_count - skipped_count}개, 건너뜀 {skipped_count}개, 실패 {error_count}개"
             else:
                 message = f"처리 완료: 성공 {success_count}개, 실패 {error_count}개"
-        
+
         self.finished_signal.emit(error_count == 0, message)
 
-    def _process_file(self, input_path: str, output_path: str) -> bool:
+def _process_file(self, input_path: str, output_path: str) -> bool:
         try:
             if self.engine.lower() == "ffmpeg":
-                cmd = [self.ffmpeg_path, '-y', '-i', input_path]
-                
+                # 입력 큐 사이즈를 늘려 대용량 파일 처리 시 버퍼 문제 예방
+                cmd = [self.ffmpeg_path, '-y', '-thread_queue_size', '512', '-i', input_path]
+
                 if self.hw_accel_option == 'nvidia':
                     cmd.extend(['-c:v', 'h264_nvenc', '-c:a', 'copy'])
                 elif self.hw_accel_option == 'amd':
@@ -468,14 +467,14 @@ class ProcessingWorker(QThread):
                     cmd.extend(['-c', 'copy'])
 
                 cmd.extend(['-movflags', '+faststart', output_path])
-            else:  # MP4Box
+            else:
                 cmd = [
                     self.mp4box_path, '-hint', input_path,
                     '-out', output_path
                 ]
 
-            self.log_signal.emit(f"실행 명령: {' '.join(cmd)}")
-            
+            self.signals.log.emit(f"실행 명령: {' '.join(cmd)}")
+
             result = subprocess.run(
                 cmd,
                 capture_output=True, text=True,
@@ -484,65 +483,204 @@ class ProcessingWorker(QThread):
             )
 
             if result.returncode != 0:
-                self.log_signal.emit(f"처리 실패: {result.stderr}")
+                self.signals.log.emit(f"처리 실패: {result.stderr}")
                 return False
 
             return True
 
         except subprocess.TimeoutExpired:
-            self.log_signal.emit(f"처리 시간 초과: {input_path}")
+            self.signals.log.emit(f"처리 시간 초과: {input_path}")
             return False
         except FileNotFoundError as e:
-            self.log_signal.emit(f"실행 파일을 찾을 수 없음: {e}")
+            self.signals.log.emit(f"실행 파일을 찾을 수 없음: {e}")
             return False
         except Exception as e:
-            self.log_signal.emit(f"처리 중 오류: {e}")
+            self.signals.log.emit(f"처리 중 오류: {e}")
             return False
 
-# 메인 GUI 클래스
+# Parallel single-file worker (QRunnable)
+class ProcessWorker(QRunnable):
+    def __init__(self, filepath: str, engine: str, config: Config,
+                 ffmpeg_path: str, mp4box_path: str, ffprobe_path: str,
+                 hw_accel_option: str):
+        super().__init__()
+        self.filepath = filepath
+        self.engine = engine
+        self.config = config
+        self.ffmpeg_path = ffmpeg_path
+        self.mp4box_path = mp4box_path
+        self.ffprobe_path = ffprobe_path
+        self.hw_accel_option = hw_accel_option
+        self.signals = WorkerSignals()
+        self._stop_requested = False
+
+    def stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        # Each ProcessWorker handles exactly one file
+        filepath = self.filepath
+        try:
+            current_status = MP4Utils.get_processing_status(filepath, self.engine, self.mp4box_path, self.ffprobe_path)
+
+            engine_specific_done = (self.engine.lower() == "ffmpeg" and "faststart 적용됨" in current_status) or \
+                                   (self.engine.lower() == "mp4box" and "hint track 존재" in current_status)
+
+            if engine_specific_done:
+                self.signals.result.emit(filepath, "이미 처리됨 ⏭️")
+                self.signals.finished.emit(filepath, True)
+                return
+
+            self.signals.result.emit(filepath, "처리 중...")
+
+            backup_path = None
+            if self.config.BACKUP_ENABLED:
+                backup_path = MP4Utils.create_backup(filepath, self.config.BACKUP_DIR)
+                if not backup_path:
+                    self.signals.result.emit(filepath, "백업 실패 ❌")
+                    self.signals.finished.emit(filepath, False)
+                    return
+
+            temp_filename = f"{uuid.uuid4().hex}.mp4"
+            temp_path = os.path.join(self.config.TEMP_DIR, temp_filename)
+
+            success = self._process_file(filepath, temp_path)
+
+            if success and os.path.exists(temp_path):
+                shutil.move(temp_path, filepath)
+                self.signals.result.emit(filepath, "완료 ✅")
+                self.signals.finished.emit(filepath, True)
+            else:
+                self.signals.result.emit(filepath, "처리 실패 ❌")
+                self.signals.finished.emit(filepath, False)
+                if backup_path and os.path.exists(backup_path):
+                    try:
+                        shutil.copy2(backup_path, filepath)
+                        self.signals.log.emit(f"백업에서 복원: {filepath}")
+                    except Exception as e:
+                        self.signals.log.emit(f"백업 복원 실패: {e}")
+
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception as e:
+                    self.signals.log.emit(f"임시 파일 삭제 실패: {e}")
+
+        except Exception as e:
+            logger.error(f"Parallel processing error for {filepath}: {e}")
+            self.signals.error.emit(filepath, str(e))
+            self.signals.finished.emit(filepath, False)
+
+    def _process_file(self, input_path: str, output_path: str) -> bool:
+        try:
+            if self.engine.lower() == "ffmpeg":
+                cmd = [self.ffmpeg_path, '-y', '-i', input_path]
+
+                if self.hw_accel_option == 'nvidia':
+                    cmd.extend(['-c:v', 'h264_nvenc', '-c:a', 'copy'])
+                elif self.hw_accel_option == 'amd':
+                    cmd.extend(['-c:v', 'h264_amf', '-c:a', 'copy'])
+                elif self.hw_accel_option == 'intel':
+                    cmd.extend(['-hwaccel', 'qsv', '-c:v', 'h264_qsv', '-c:a', 'copy'])
+                else:
+                    cmd.extend(['-c', 'copy'])
+
+                cmd.extend(['-movflags', '+faststart', output_path])
+            else:
+                cmd = [
+                    self.mp4box_path, '-hint', input_path,
+                    '-out', output_path
+                ]
+
+            self.signals.log.emit(f"실행 명령: {' '.join(cmd)}")
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True, text=True,
+                encoding='utf-8', errors='ignore',
+                timeout=self.config.TIMEOUT, startupinfo=startupinfo
+            )
+
+            if result.returncode != 0:
+                self.signals.log.emit(f"처리 실패: {result.stderr}")
+                return False
+
+            return True
+
+        except subprocess.TimeoutExpired:
+            self.signals.log.emit(f"처리 시간 초과: {input_path}")
+            return False
+        except FileNotFoundError as e:
+            self.signals.log.emit(f"실행 파일을 찾을 수 없음: {e}")
+            return False
+        except Exception as e:
+            self.signals.log.emit(f"처리 중 오류: {e}")
+            return False
+
+# Main GUI
 class MP4ProcessorApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.config = Config()
         self.threadpool = QThreadPool()
         self.threadpool.setMaxThreadCount(self.config.MAX_PARALLEL)
-        
         self.ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg.exe"
         self.ffprobe_path = shutil.which("ffprobe") or "ffprobe.exe"
         self.mp4box_path = shutil.which("MP4Box") or "MP4Box.exe"
-        
+
+        # For serial worker
         self.processing_worker = None
+
+        # For parallel tracking
+        self._parallel_total = 0
+        self._parallel_done = 0
+        self._parallel_success = 0
+        self._parallel_errors = 0
+
         self.hw_accel_type = 'none'
         self.init_ui()
         self.check_dependencies()
         self.detect_hw_accel()
 
     def detect_hw_accel(self):
-        """GPU/CPU 및 FFmpeg 지원 환경 감지"""
         self.hw_accel_type = 'none'
         self.hw_accel_combo.setEnabled(False)
-
         vendor = "none"
         codecs = []
         cpu_cores = psutil.cpu_count(logical=True) or 1
 
-        # GPU 제조사 감지 (Windows만 wmi 사용)
         if platform.system() == "Windows":
             try:
-                import wmi
-                c = wmi.WMI()
-                for gpu in c.Win32_VideoController():
-                    name = gpu.Name.upper()
-                    if "NVIDIA" in name:
-                        vendor = "nvidia"
-                    elif "INTEL" in name:
-                        vendor = "intel"
-                    elif "AMD" in name:
-                        vendor = "amd"
+                import winreg
+                found_gpu = False
+                # 0000부터 0003까지 순회 (최대 4개 GPU 슬롯 확인)
+                for i in range(4):
+                    try:
+                        key_path = rf"SYSTEM\CurrentControlSet\Control\Class\{{4d36e968-e325-11ce-bfc1-08002be10318}}\{i:04d}"
+                        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path)
+                        gpu_desc = winreg.QueryValueEx(key, "DriverDesc")[0].upper()
+                        winreg.CloseKey(key)
+                        
+                        if "NVIDIA" in gpu_desc or "INTEL" in gpu_desc or "AMD" in gpu_desc:
+                            if "NVIDIA" in gpu_desc:
+                                vendor = "nvidia"
+                            elif "INTEL" in gpu_desc:
+                                vendor = "intel"
+                            elif "AMD" in gpu_desc:
+                                vendor = "amd"
+                            self.log(f"GPU 감지: {gpu_desc}")
+                            found_gpu = True
+                            break
+                    except FileNotFoundError:
+                        continue
+                    except Exception:
+                        continue
+                
+                if not found_gpu:
+                    self.log("레지스트리에서 GPU를 찾을 수 없습니다")
             except Exception as e:
-                self.log(f"WMI GPU 감지 실패: {e}")
-
-        # FFmpeg에서 지원하는 인코더 확인
+                self.log(f"레지스트리 GPU 감지 실패: {e}")
+				
         try:
             result = subprocess.run(
                 [self.ffmpeg_path, "-hide_banner", "-encoders"],
@@ -560,7 +698,6 @@ class MP4ProcessorApp(QMainWindow):
         except Exception as e:
             self.log(f"FFmpeg 인코더 감지 실패: {e}")
 
-        # 최종 가속 방식 결정
         if vendor == "nvidia" and "nvidia" in codecs:
             self.hw_accel_type = "nvidia"
         elif vendor == "intel" and "intel" in codecs:
@@ -570,46 +707,42 @@ class MP4ProcessorApp(QMainWindow):
         else:
             self.hw_accel_type = "none"
 
-        # UI 반영
         if self.hw_accel_type != "none":
             self.hw_accel_combo.setEnabled(True)
             self.log(f"{vendor.upper()} GPU 감지됨 → 하드웨어 가속({self.hw_accel_type}) 사용 가능")
         else:
             self.log(f"지원 GPU 없음 또는 FFmpeg 미지원. CPU 모드 ({cpu_cores} 쓰레드)")
 
-        # CPU 정보도 기록
-        self.log(f"CPU 코어 수: {cpu_cores}") 
+        self.log(f"CPU 코어 수: {cpu_cores}")
 
     def init_ui(self):
         self.setWindowTitle("MP4 HintBox Pro - by suldo.com")
-        self.setGeometry(100, 100, 1000, 600)
-        
+        self.setGeometry(100, 100, 800, 400)
         self.setAcceptDrops(True)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
         main_layout = QVBoxLayout(central_widget)
         splitter = QSplitter(Qt.Vertical)
         main_layout.addWidget(splitter)
 
         control_widget = QWidget()
         control_layout = QVBoxLayout(control_widget)
-        
+
         button_layout1 = QHBoxLayout()
         self.add_btn = QPushButton("파일 추가")
         self.add_btn.clicked.connect(self.add_files)
-        
+
         self.process_selected_btn = QPushButton("선택 파일 처리")
         self.process_selected_btn.clicked.connect(self.process_selected)
-        
+
         self.process_all_btn = QPushButton("전체 파일 처리")
         self.process_all_btn.clicked.connect(self.process_all)
-        
+
         self.cancel_btn = QPushButton("취소")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self.cancel_processing)
-        
+
         button_layout1.addWidget(self.add_btn)
         button_layout1.addWidget(self.process_selected_btn)
         button_layout1.addWidget(self.process_all_btn)
@@ -617,28 +750,35 @@ class MP4ProcessorApp(QMainWindow):
 
         button_layout2 = QHBoxLayout()
         button_layout2.addWidget(QLabel("처리 엔진:"))
-        
+
         self.engine_combo = QComboBox()
         self.engine_combo.addItems(["FFmpeg (FastStart)", "MP4Box (Hint Track)"])
         self.engine_combo.currentTextChanged.connect(self.on_engine_changed)
         button_layout2.addWidget(self.engine_combo)
-        
+
         self.hw_accel_combo = QComboBox()
         self.hw_accel_combo.addItems(["CPU (Copy)", "GPU (Transcode)"])
         self.hw_accel_combo.setEnabled(False)
         button_layout2.addWidget(self.hw_accel_combo)
-        
+
         self.backup_checkbox = QCheckBox("백업 생성")
         self.backup_checkbox.setChecked(self.config.BACKUP_ENABLED)
         self.backup_checkbox.toggled.connect(self.on_backup_toggled)
         button_layout2.addWidget(self.backup_checkbox)
-        
+
+        # New: processing mode selector
+        button_layout2.addWidget(QLabel("처리 방식:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["직렬 처리 (Serial)", "병렬 처리 (Parallel)"])
+        self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
+        button_layout2.addWidget(self.mode_combo)
+
         self.del_selected_btn = QPushButton("선택 삭제")
         self.del_selected_btn.clicked.connect(self.delete_selected)
-        
+
         self.del_all_btn = QPushButton("전체 삭제")
         self.del_all_btn.clicked.connect(self.delete_all)
-        
+
         button_layout2.addWidget(self.del_selected_btn)
         button_layout2.addWidget(self.del_all_btn)
         button_layout2.addStretch()
@@ -650,9 +790,8 @@ class MP4ProcessorApp(QMainWindow):
         self.file_list = DragDropListWidget()
         self.file_list.setSelectionMode(QListWidget.ExtendedSelection)
         self.file_list.itemDoubleClicked.connect(self.retry_file)
-        
         self.file_list.files_dropped.connect(self.on_files_dropped)
-        
+
         control_layout.addWidget(file_label)
         control_layout.addWidget(self.file_list)
 
@@ -667,22 +806,32 @@ class MP4ProcessorApp(QMainWindow):
         log_widget = QWidget()
         log_layout = QVBoxLayout(log_widget)
         log_layout.addWidget(QLabel("처리 로그:"))
-        
+
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(200)
         font = QFont("Consolas", 9)
         self.log_text.setFont(font)
         log_layout.addWidget(self.log_text)
-        
+
         splitter.addWidget(log_widget)
-        
         splitter.setSizes([500, 200])
-		
-                # 프로그램 정보 라벨
+
+# 하단 정보 영역을 위한 수평 레이아웃 생성
+        bottom_layout = QHBoxLayout()
+
+        # 왼쪽: Official Website 링크
+        website_label = QLabel('<a href="https://hint.ev7.net">Official Website</a>')
+        website_label.setOpenExternalLinks(True)
+        website_label.setAlignment(Qt.AlignLeft)
+        bottom_layout.addWidget(website_label)
+
+        # 오른쪽: 기존 버전 정보
         info_label = QLabel(f"{QApplication.applicationName()} v{QApplication.applicationVersion()} © {QApplication.organizationName()}")
         info_label.setAlignment(Qt.AlignRight)
-        main_layout.addWidget(info_label)
+        bottom_layout.addWidget(info_label)
+
+        main_layout.addLayout(bottom_layout)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -692,7 +841,7 @@ class MP4ProcessorApp(QMainWindow):
                     event.acceptProposedAction()
                     return
         event.ignore()
-    
+
     def dropEvent(self, event):
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
@@ -771,7 +920,7 @@ class MP4ProcessorApp(QMainWindow):
     def get_current_engine(self) -> str:
         text = self.engine_combo.currentText()
         return "ffmpeg" if "FFmpeg" in text else "mp4box"
-            
+
     def get_current_hw_accel_option(self) -> str:
         text = self.hw_accel_combo.currentText()
         return self.hw_accel_type if "GPU" in text else "none"
@@ -795,6 +944,11 @@ class MP4ProcessorApp(QMainWindow):
     def on_backup_toggled(self, checked: bool):
         self.config.BACKUP_ENABLED = checked
         self.log(f"백업 {'활성화' if checked else '비활성화'}")
+
+    def on_mode_changed(self, index: int):
+        mode = "serial" if index == 0 else "parallel"
+        self.config.PROCESS_MODE = mode
+        self.log(f"처리 방식 변경: {'직렬' if mode=='serial' else '병렬'}")
 
     def delete_selected(self):
         selected_items = self.file_list.selectedItems()
@@ -843,6 +997,7 @@ class MP4ProcessorApp(QMainWindow):
         elif engine == "mp4box" and not shutil.which(self.mp4box_path.split()[0]):
             QMessageBox.warning(self, "오류", "MP4Box를 찾을 수 없습니다.")
             return
+
         files_to_process = []
         already_processed = []
         for filepath in filepaths:
@@ -862,6 +1017,7 @@ class MP4ProcessorApp(QMainWindow):
             except Exception as e:
                 self.log(f"상태 확인 실패 - {os.path.basename(filepath)}: {e}")
                 files_to_process.append(filepath)
+
         if already_processed:
             if len(already_processed) == len(filepaths):
                 QMessageBox.information(self, "알림", f"선택된 모든 파일이 이미 처리되어 있습니다.\n처리된 파일: {len(already_processed)}개")
@@ -877,27 +1033,92 @@ class MP4ProcessorApp(QMainWindow):
                 )
                 if reply != QMessageBox.Yes:
                     return
+
         if not files_to_process:
             return
+
+        # UI lock and progress setup
         self.toggle_ui(False)
         self.progress_bar.setVisible(True)
-        self.progress_bar.setMaximum(len(filepaths))
+        total_count = len(filepaths)
+        self.progress_bar.setMaximum(total_count)
         self.progress_bar.setValue(0)
-        self.processing_worker = ProcessingWorker(
-            filepaths, engine, self.config,
-            self.ffmpeg_path, self.mp4box_path, self.ffprobe_path,
-            hw_accel_option=hw_accel_option
-        )
-        self.processing_worker.progress_signal.connect(self.update_progress)
-        self.processing_worker.finished_signal.connect(self.finish_processing)
-        self.processing_worker.log_signal.connect(self.log)
-        self.processing_worker.start()
-        self.log(f"처리 시작: 전체 {len(filepaths)}개 파일 (처리 대상: {len(files_to_process)}개, 건너뜀: {len(already_processed)}개), 엔진: {self.engine_combo.currentText()}, 가속: {self.hw_accel_combo.currentText()}")
+        self.progress_label.setText(f"처리 중 (0/{total_count})")
+
+        if self.config.PROCESS_MODE == "serial":
+            # Use original serial worker
+            self.processing_worker = ProcessingWorker(
+                filepaths, engine, self.config,
+                self.ffmpeg_path, self.mp4box_path, self.ffprobe_path,
+                hw_accel_option=hw_accel_option
+            )
+            self.processing_worker.progress_signal.connect(self.update_progress)
+            self.processing_worker.finished_signal.connect(self.finish_processing)
+            self.processing_worker.log_signal.connect(self.log)
+            self.processing_worker.start()
+            self.log(f"직렬 처리 시작: 전체 {len(filepaths)}개 파일 (처리 대상: {len(files_to_process)}개), 엔진: {self.engine_combo.currentText()}, 가속: {self.hw_accel_combo.currentText()}")
+        else:
+            # Parallel mode using QThreadPool and ProcessWorker per file
+            self._parallel_total = len(files_to_process)
+            self._parallel_done = 0
+            self._parallel_success = 0
+            self._parallel_errors = 0
+
+            # For progress display we count completions (including skipped)
+            for filepath in files_to_process:
+                pw = ProcessWorker(filepath, engine, self.config,
+                                   self.ffmpeg_path, self.mp4box_path, self.ffprobe_path,
+                                   hw_accel_option=hw_accel_option)
+                pw.signals.result.connect(self.update_file_status)
+                pw.signals.log.connect(self.log)
+                pw.signals.error.connect(self.handle_parallel_error)
+                pw.signals.finished.connect(self.handle_parallel_finished)
+                self.threadpool.start(pw)
+
+            self.log(f"병렬 처리 시작: 전체 {len(filepaths)}개 파일 (병렬 대상: {len(files_to_process)}개), 최대 동시 작업: {self.threadpool.maxThreadCount()}, 엔진: {self.engine_combo.currentText()}, 가속: {self.hw_accel_combo.currentText()}")
+
+    def handle_parallel_error(self, filepath: str, error: str):
+        self.log(f"병렬 처리 오류 - {os.path.basename(filepath)}: {error}")
+
+    def handle_parallel_finished(self, filepath: str, success: bool):
+        # Update counters and progress bar
+        self._parallel_done += 1
+        if success:
+            self._parallel_success += 1
+        else:
+            self._parallel_errors += 1
+
+        # Update progress UI (value is count of completed files among total requested)
+        self.progress_bar.setValue(self._parallel_done)
+        self.progress_label.setText(f"처리 중 ({self._parallel_done}/{self.progress_bar.maximum()})")
+
+        # Log short summary per completion is handled in update_file_status already
+        if self._parallel_done >= self.progress_bar.maximum():
+            # All done; finalize
+            self.toggle_ui(True)
+            self.progress_bar.setValue(self.progress_bar.maximum())
+            self.progress_bar.setVisible(False)
+            if self._parallel_errors == 0:
+                QMessageBox.information(self, "완료", f"병렬 처리 완료: 성공 {self._parallel_success}개, 실패 {self._parallel_errors}개")
+            else:
+                QMessageBox.warning(self, "완료", f"병렬 처리 완료: 성공 {self._parallel_success}개, 실패 {self._parallel_errors}개")
+            self.log(f"병렬 처리 완료: 성공 {self._parallel_success}개, 실패 {self._parallel_errors}개")
+            # reset parallel counters
+            self._parallel_total = 0
+            self._parallel_done = 0
+            self._parallel_success = 0
+            self._parallel_errors = 0
 
     def cancel_processing(self):
-        if self.processing_worker:
+        # For serial processing
+        if self.processing_worker and isinstance(self.processing_worker, ProcessingWorker):
             self.processing_worker.stop()
-            self.log("처리 취소 요청됨")
+            self.log("직렬 처리 취소 요청됨")
+        # For parallel processing: we can't easily stop already-started subprocesses here,
+        # but we can clear the threadpool queue (PyQt5 doesn't provide direct cancellation for running QRunnable).
+        # For best-effort, set a flag on queued workers is needed; but we don't maintain references to all.
+        # Inform user:
+        self.log("병렬 처리 도중에는 즉시 취소가 제한적입니다 (진행 중인 작업은 완료 또는 타임아웃 후 중지됩니다).")
 
     def retry_file(self, item):
         filepath = item.text().split(" | ")[0]
@@ -938,6 +1159,7 @@ class MP4ProcessorApp(QMainWindow):
         self.backup_checkbox.setEnabled(enabled)
         self.del_selected_btn.setEnabled(enabled)
         self.del_all_btn.setEnabled(enabled)
+        self.mode_combo.setEnabled(enabled)
 
     def log(self, message: str):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -951,7 +1173,7 @@ class MP4ProcessorApp(QMainWindow):
             if item.text().split(" | ")[0] == filepath:
                 item.setText(f"{filepath} | {status}")
                 break
-    
+
         if current == total and "완료" not in status:
             self.progress_bar.setValue(99)
         else:
@@ -964,10 +1186,8 @@ class MP4ProcessorApp(QMainWindow):
 
     def finish_processing(self, success: bool, message: str):
         self.toggle_ui(True)
-        
         self.progress_bar.setValue(self.progress_bar.maximum())
         self.progress_bar.setVisible(False)
-
         self.progress_label.setText("처리 완료")
         if success:
             QMessageBox.information(self, "완료", message)
@@ -976,8 +1196,20 @@ class MP4ProcessorApp(QMainWindow):
         self.log(f"처리 완료: {message}")
         self.processing_worker = None
 
+    def update_file_status(self, filepath: str, status: str):
+        # update list item text
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            if item.text().split(" | ")[0] == filepath:
+                item.setText(f"{filepath} | {status}")
+                break
+        # Also log succinctly when finished/failed
+        if "완료" in status or "처리 실패" in status or "이미 처리됨" in status:
+            filename = os.path.basename(filepath)
+            self.log(f"{filename}: {status}")
+
     def closeEvent(self, event):
-        if self.processing_worker and self.processing_worker.isRunning():
+        if self.processing_worker and isinstance(self.processing_worker, ProcessingWorker) and self.processing_worker.isRunning():
             reply = QMessageBox.question(
                 self, "종료", "처리가 진행 중입니다. 종료하시겠습니까?",
                 QMessageBox.Yes | QMessageBox.No
@@ -994,16 +1226,16 @@ class MP4ProcessorApp(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    app.setApplicationName("MP4 Processor Pro")
-    app.setApplicationVersion("1.0.1")
+    app.setApplicationName("MP4 HintBox Pro")
+    app.setApplicationVersion("1.0.4")
     app.setOrganizationName("suldo.com")
-	
+
     try:
         from PyQt5.QtGui import QIcon
         app.setWindowIcon(QIcon("app_icon.ico"))
     except Exception as e:
         print(f"아이콘 설정 실패: {e}")
-		
+
     window = MP4ProcessorApp()
     window.show()
     sys.exit(app.exec_())
