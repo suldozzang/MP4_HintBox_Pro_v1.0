@@ -130,7 +130,7 @@ class AppConfig:
     output_mode: str = OutputMode.OVERWRITE.value
     output_dir: str = ""
     output_suffix: str = "_fs"
-    audio_sync_offset_sec: float = 0.15
+    audio_sync_offset_sec: float = 0.00
     show_log: bool = False
     theme: str = "dark"
     recent_dirs: List[str] = field(default_factory=list)
