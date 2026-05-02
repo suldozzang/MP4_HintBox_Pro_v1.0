@@ -209,7 +209,7 @@ class AppConfig:
     auto_cleanup_temp: bool = True
     theme: str = "dark"                # dark / light
     native_faststart: bool = True      # FFmpeg 우회 고속 처리 (기본 ON)
-    audio_sync_offset_sec: float = 0.15  # Native 처리 시 오디오 싱크 보정 (양수=오디오 앞으로)
+    audio_sync_offset_sec: float = 0.00  # Native 처리 시 오디오 싱크 보정 (양수=오디오 앞으로)
     show_log: bool = False             # 처리 로그 패널 표시 (기본 숨김)
     recent_dirs: List[str] = field(default_factory=list)
 
